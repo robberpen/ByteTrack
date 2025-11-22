@@ -36,51 +36,47 @@ from collections import OrderedDict
 from pathlib import Path
 
 
-def analyze_id_switches(results_folder=None, results_file=None, gt_folder='datasets/mot/train', gt_type='_val_half'):
+def load_tracking_data(results_folder=None, results_file=None, gt_folder='datasets/mot/train', gt_type='_val_half'):
     """
-    Analyze ID switches in tracking results.
+    Load ground truth and tracking result files.
 
     Args:
-        results_folder: Path to tracking results folder (default: YOLOX_outputs/yolox_x_mot17_half/track_results)
+        results_folder: Path to tracking results folder
         results_file: Path to a specific tracking result file (overrides results_folder)
-        gt_folder: Path to ground truth folder (default: datasets/mot/train)
-        gt_type: Ground truth type suffix (e.g., '_val_half', '') (default: '_val_half')
-    """
+        gt_folder: Path to ground truth folder
+        gt_type: Ground truth type suffix (e.g., '_val_half', '')
 
-    # Setup
+    Returns:
+        tuple: (gt_dict, ts_dict, gtfiles, tsfiles, results_folder)
+               Returns (None, None, None, None, None) on error
+    """
     mm.lap.default_solver = 'lap'
 
     # Load ground truth files
-    gtfiles = glob.glob(
-        os.path.join(gt_folder, '*/gt/gt{}.txt'.format(gt_type)))
+    gtfiles = glob.glob(os.path.join(gt_folder, '*/gt/gt{}.txt'.format(gt_type)))
 
     # Load tracking result files
     if results_file:
-        # Single file mode
         if not os.path.exists(results_file):
             logger.error(f"Results file not found: {results_file}")
-            return
+            return None, None, None, None, None
         tsfiles = [results_file]
         results_folder = os.path.dirname(results_file)
     elif results_folder:
-        # Folder mode
         if not os.path.exists(results_folder):
             logger.error(f"Results folder not found: {results_folder}")
-            return
+            return None, None, None, None, None
         tsfiles = [f for f in glob.glob(os.path.join(results_folder, '*.txt'))
                    if not os.path.basename(f).startswith('eval')]
     else:
         logger.error("Either results_folder or results_file must be specified")
-        return
-
-    logger.info('Found {} groundtruths and {} test files.'.format(len(gtfiles), len(tsfiles)))
+        return None, None, None, None, None
 
     if len(gtfiles) == 0 or len(tsfiles) == 0:
         logger.error("No ground truth or tracking files found!")
-        return
+        return None, None, None, None, None
 
     # Load data into motmetrics format
-    logger.info('Loading ground truth and tracking results...')
     gt = OrderedDict([
         (Path(f).parts[-3], mm.io.loadtxt(f, fmt='mot15-2D', min_confidence=1))
         for f in gtfiles
@@ -90,54 +86,71 @@ def analyze_id_switches(results_folder=None, results_file=None, gt_folder='datas
         for f in tsfiles
     ])
 
-    # Create accumulators for each sequence
-    logger.info('Creating accumulators and computing metrics...')
+    return gt, ts, gtfiles, tsfiles, results_folder
+
+
+def create_accumulators(gt, ts):
+    """
+    Create motmetrics accumulators by comparing tracking results to ground truth.
+
+    Args:
+        gt: OrderedDict of ground truth data (seq_name -> DataFrame)
+        ts: OrderedDict of tracking result data (seq_name -> DataFrame)
+
+    Returns:
+        OrderedDict: accumulators (seq_name -> MOTAccumulator)
+    """
     accumulators = OrderedDict()
 
     for seq_name in ts.keys():
         if seq_name in gt:
-            logger.info(f'Processing {seq_name}...')
-            # Create accumulator by comparing to ground truth
             acc = mm.utils.compare_to_groundtruth(gt[seq_name], ts[seq_name], 'iou', distth=0.5)
             accumulators[seq_name] = acc
         else:
             logger.warning(f'No ground truth for {seq_name}, skipping.')
 
-    # Analyze ID switches for each sequence
-    logger.info('\n' + '='*80)
-    logger.info('ID SWITCH ANALYSIS RESULTS')
-    logger.info('='*80)
+    return accumulators
 
-    all_switches_data = []
+
+def extract_id_switches(accumulators):
+    """
+    Extract ID switch events from accumulators.
+
+    Args:
+        accumulators: OrderedDict of MOTAccumulators (seq_name -> accumulator)
+
+    Returns:
+        dict: Nested dict structure:
+              {
+                  seq_name: {
+                      'switches_df': DataFrame of SWITCH events,
+                      'frames_with_switches': list of frame IDs,
+                      'num_switches': int,
+                      'switches_data': list of dicts with detailed switch info
+                  }
+              }
+    """
+    switches_by_sequence = {}
 
     for seq_name, acc in accumulators.items():
-        logger.info(f'\n{seq_name}:')
-        logger.info('-' * 60)
-
-        # Get all events
         events_df = acc.events
-
-        # Filter for SWITCH events only
         switches_df = events_df[events_df['Type'] == 'SWITCH']
-
-        # Total number of switches
         num_switches = len(switches_df)
-        logger.info(f'Total ID switches: {num_switches}')
 
         if num_switches == 0:
-            logger.info('No ID switches detected in this sequence.')
+            switches_by_sequence[seq_name] = {
+                'switches_df': switches_df,
+                'frames_with_switches': [],
+                'num_switches': 0,
+                'switches_data': []
+            }
             continue
 
-        # Get frames with switches
         frames_with_switches = switches_df.index.get_level_values(0).unique().tolist()
-        logger.info(f'Number of frames with switches: {len(frames_with_switches)}')
-        logger.info(f'Frame IDs with switches: {frames_with_switches[:20]}{"..." if len(frames_with_switches) > 20 else ""}')
 
-        # Detailed analysis of switches
-        logger.info('\nDetailed switch information (showing first 10):')
-
-        switch_count = 0
-        for frame_id in sorted(frames_with_switches)[:10]:
+        # Extract detailed switch information
+        switches_data = []
+        for frame_id in frames_with_switches:
             frame_switches = switches_df.loc[frame_id]
 
             # Handle both single row and multiple rows
@@ -145,31 +158,124 @@ def analyze_id_switches(results_folder=None, results_file=None, gt_folder='datas
                 frame_switches = frame_switches.to_frame().T
 
             for idx, switch in frame_switches.iterrows():
-                obj_id = int(switch['OId']) if not pd.isna(switch['OId']) else 'Unknown'
-                hyp_id = int(switch['HId']) if not pd.isna(switch['HId']) else 'Unknown'
-                iou_dist = switch['D'] if not pd.isna(switch['D']) else 'N/A'
+                obj_id = int(switch['OId']) if not pd.isna(switch['OId']) else None
+                hyp_id = int(switch['HId']) if not pd.isna(switch['HId']) else None
+                iou_dist = switch['D'] if not pd.isna(switch['D']) else None
 
-                logger.info(f'  Frame {frame_id}: Object {obj_id} → Tracker {hyp_id} (IoU distance: {iou_dist:.3f})')
-
-                # Collect data for CSV export
-                all_switches_data.append({
-                    'Sequence': seq_name,
-                    'Frame': frame_id,
-                    'Object_ID': obj_id,
-                    'Tracker_ID': hyp_id,
-                    'IoU_Distance': iou_dist
+                switches_data.append({
+                    'frame': frame_id,
+                    'object_id': obj_id,
+                    'tracker_id': hyp_id,
+                    'iou_distance': iou_dist
                 })
 
-                switch_count += 1
+        switches_by_sequence[seq_name] = {
+            'switches_df': switches_df,
+            'frames_with_switches': frames_with_switches,
+            'num_switches': num_switches,
+            'switches_data': switches_data
+        }
 
-        if num_switches > 10:
-            logger.info(f'  ... and {num_switches - switch_count} more switches')
+    return switches_by_sequence
+
+
+def export_switches_csv(switches_by_sequence, output_path):
+    """
+    Export ID switches to CSV file.
+
+    Args:
+        switches_by_sequence: dict returned by extract_id_switches()
+        output_path: Path to save CSV file
+
+    Returns:
+        str: Path to saved CSV file, or None if no data
+    """
+    all_switches_data = []
+
+    for seq_name, seq_data in switches_by_sequence.items():
+        for switch in seq_data['switches_data']:
+            all_switches_data.append({
+                'Sequence': seq_name,
+                'Frame': switch['frame'],
+                'Object_ID': switch['object_id'],
+                'Tracker_ID': switch['tracker_id'],
+                'IoU_Distance': switch['iou_distance']
+            })
+
+    if all_switches_data:
+        switches_export_df = pd.DataFrame(all_switches_data)
+        switches_export_df.to_csv(output_path, index=False)
+        return output_path
+
+    return None
+
+
+def analyze_id_switches(results_folder=None, results_file=None, gt_folder='datasets/mot/train', gt_type='_val_half'):
+    """
+    Analyze ID switches in tracking results.
+
+    Args:
+        results_folder: Path to tracking results folder (default: YOLOX_outputs/yolox_x_mot17_half/track_results)
+        results_file: Path to a specific tracking result file (overrides results_folder)
+        gt_folder: Path to ground truth folder (default: datasets/mot/train)
+        gt_type: Ground truth type suffix (e.g., '_val_half', '') (default: '_val_half')
+
+    Returns:
+        dict: Analysis results containing:
+              - 'gt': Ground truth data
+              - 'ts': Tracking result data
+              - 'accumulators': MOTAccumulators
+              - 'switches': ID switch data by sequence
+              - 'summary': Overall metrics summary
+              - 'csv_path': Path to exported CSV (if any)
+              Returns None on error
+    """
+    # Load data
+    gt, ts, gtfiles, tsfiles, results_folder = load_tracking_data(results_folder, results_file, gt_folder, gt_type)
+    if gt is None:
+        return None
+
+    logger.info('Found {} groundtruths and {} test files.'.format(len(gtfiles), len(tsfiles)))
+    logger.info('Loading ground truth and tracking results...')
+
+    # Create accumulators
+    logger.info('Creating accumulators and computing metrics...')
+    accumulators = create_accumulators(gt, ts)
+
+    # Extract ID switches
+    switches_by_sequence = extract_id_switches(accumulators)
+
+    # Log analysis results
+    logger.info('\n' + '='*80)
+    logger.info('ID SWITCH ANALYSIS RESULTS')
+    logger.info('='*80)
+
+    for seq_name, seq_data in switches_by_sequence.items():
+        logger.info(f'\n{seq_name}:')
+        logger.info('-' * 60)
+        logger.info(f'Total ID switches: {seq_data["num_switches"]}')
+
+        if seq_data['num_switches'] == 0:
+            logger.info('No ID switches detected in this sequence.')
+            continue
+
+        frames = seq_data['frames_with_switches']
+        logger.info(f'Number of frames with switches: {len(frames)}')
+        logger.info(f'Frame IDs with switches: {frames[:20]}{"..." if len(frames) > 20 else ""}')
+
+        logger.info('\nDetailed switch information (showing first 10):')
+        for switch in seq_data['switches_data'][:10]:
+            logger.info(f'  Frame {switch["frame"]}: Object {switch["object_id"]} → '
+                       f'Tracker {switch["tracker_id"]} (IoU distance: {switch["iou_distance"]:.3f})')
+
+        if seq_data['num_switches'] > 10:
+            logger.info(f'  ... and {seq_data["num_switches"] - 10} more switches')
 
     # Export to CSV
-    if all_switches_data:
+    csv_path = None
+    if any(seq_data['num_switches'] > 0 for seq_data in switches_by_sequence.values()):
         csv_path = os.path.join(results_folder, 'id_switches_analysis.csv')
-        switches_export_df = pd.DataFrame(all_switches_data)
-        switches_export_df.to_csv(csv_path, index=False)
+        export_switches_csv(switches_by_sequence, csv_path)
         logger.info(f'\n✓ Detailed switch data exported to: {csv_path}')
 
     # Summary statistics
@@ -177,7 +283,6 @@ def analyze_id_switches(results_folder=None, results_file=None, gt_folder='datas
     logger.info('SUMMARY')
     logger.info('='*80)
 
-    # Compute overall metrics
     mh = mm.metrics.create()
     metrics = ['num_switches', 'num_objects']
     summary = mh.compute_many(
@@ -206,9 +311,19 @@ def analyze_id_switches(results_folder=None, results_file=None, gt_folder='datas
 
     logger.info('\n2. Which frames have ID switches?')
     logger.info('   → See detailed output above for frame-by-frame breakdown')
-    logger.info(f'   → Full details exported to: {csv_path if all_switches_data else "N/A"}')
+    logger.info(f'   → Full details exported to: {csv_path if csv_path else "N/A"}')
 
     logger.info('\n' + '='*80)
+
+    # Return analysis results for programmatic use
+    return {
+        'gt': gt,
+        'ts': ts,
+        'accumulators': accumulators,
+        'switches': switches_by_sequence,
+        'summary': summary,
+        'csv_path': csv_path
+    }
 
 
 def make_parser():
