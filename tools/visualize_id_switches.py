@@ -40,7 +40,8 @@ from collections import defaultdict
 from analyze_id_switches import (
     load_tracking_data,
     create_accumulators,
-    extract_id_switches
+    extract_id_switches,
+    export_switches_csv
 )
 
 
@@ -186,8 +187,8 @@ def parse_tracking_results(txt_path):
             if len(parts) < 7:
                 continue
 
-            frame_id = int(parts[0])
-            tracker_id = int(parts[1])
+            frame_id = int(float(parts[0]))
+            tracker_id = int(float(parts[1]))  # Convert float to int (SORT outputs floats)
             x1 = float(parts[2])
             y1 = float(parts[3])
             w = float(parts[4])
@@ -396,7 +397,8 @@ def images_to_video(output_dir, fps=16, size=(1920, 1080)):
 def visualize_id_switches(results_folder=None, results_file=None,
                           gt_folder='datasets/mot/train', gt_type='_val_half',
                           json_path=None, output_dir='visual_id_switches',
-                          generate_video=True, fps=16, video_size=(1920, 1080)):
+                          generate_video=True, fps=16, video_size=(1920, 1080),
+                          export_csv=True):
     """
     Main visualization function.
 
@@ -410,6 +412,7 @@ def visualize_id_switches(results_folder=None, results_file=None,
         generate_video: Whether to compile video
         fps: Video frame rate
         video_size: Video resolution (width, height)
+        export_csv: Whether to export ID switches to CSV (default: True)
     """
     logger.info('='*80)
     logger.info('Starting ID Switch Visualization')
@@ -501,6 +504,16 @@ def visualize_id_switches(results_folder=None, results_file=None,
             color_list
         )
 
+    # Export ID switches to CSV if requested
+    csv_path = None
+    if export_csv and total_switches > 0:
+        logger.info('\n' + '='*80)
+        logger.info('EXPORTING ID SWITCHES TO CSV')
+        logger.info('='*80)
+        csv_path = os.path.join(output_dir, 'id_switches_summary.csv')
+        export_switches_csv(switches_by_sequence, csv_path)
+        logger.info(f'✓ ID switches exported to: {csv_path}')
+
     # Generate video if requested
     video_path = None
     if generate_video:
@@ -513,6 +526,8 @@ def visualize_id_switches(results_folder=None, results_file=None,
     logger.info('='*80)
     logger.info(f'Total ID switches visualized: {total_switches}')
     logger.info(f'Frame images saved to: {output_dir}/')
+    if csv_path:
+        logger.info(f'CSV exported to: {csv_path}')
     if video_path:
         logger.info(f'Video saved to: {video_path}')
     logger.info('='*80)
@@ -520,6 +535,7 @@ def visualize_id_switches(results_folder=None, results_file=None,
     return {
         'output_dir': output_dir,
         'video_path': video_path,
+        'csv_path': csv_path,
         'total_switches': total_switches
     }
 
@@ -543,6 +559,9 @@ Examples:
   # Generate images only (no video)
   python3 tools/visualize_id_switches.py --no-video
 
+  # Skip CSV export
+  python3 tools/visualize_id_switches.py --no-csv
+
   # Custom video settings
   python3 tools/visualize_id_switches.py --fps 30 --size 1280 720
 
@@ -557,6 +576,7 @@ Examples:
 
 Output:
   - Individual frame images: <output_dir>/<sequence><frame_id>.png
+  - CSV file: <output_dir>/id_switches_summary.csv
   - Video file: <output_dir>_video.avi
 
 Visual Annotations:
@@ -614,6 +634,12 @@ Visual Annotations:
     )
 
     parser.add_argument(
+        '--no-csv',
+        action='store_true',
+        help='Skip CSV export of ID switches'
+    )
+
+    parser.add_argument(
         '--fps',
         type=int,
         default=16,
@@ -644,6 +670,7 @@ if __name__ == '__main__':
     logger.info(f'  JSON path: {args.json_path}')
     logger.info(f'  Output directory: {args.output_dir}')
     logger.info(f'  Generate video: {not args.no_video}')
+    logger.info(f'  Export CSV: {not args.no_csv}')
     logger.info(f'  Video FPS: {args.fps}')
     logger.info(f'  Video size: {args.size[0]}x{args.size[1]}')
     logger.info('')
@@ -657,6 +684,7 @@ if __name__ == '__main__':
         json_path=args.json_path,
         output_dir=args.output_dir,
         generate_video=not args.no_video,
+        export_csv=not args.no_csv,
         fps=args.fps,
         video_size=tuple(args.size)
     )
